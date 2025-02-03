@@ -1,0 +1,4 @@
+openai
+groq
+pymilvus[model]
+milvus-model
