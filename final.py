@@ -253,6 +253,25 @@ def process_question(qid, new_question):
         "generated_by": response_source,
     }
 
+# ✅ Function to Append JSON After Each Question Pair
+def append_to_json(new_data, filename=OUTPUT_JSON_FILE):
+    """Reads existing JSON, appends new data, and writes back."""
+    try:
+        if os.path.exists(filename):
+            with open(filename, "r", encoding="utf-8") as f:
+                existing_data = json.load(f)  # Load current content
+        else:
+            existing_data = []  # Create new if file doesn't exist
+
+        existing_data.append(new_data)  # Append new entry
+
+        with open(filename, "w", encoding="utf-8") as f:
+            json.dump(existing_data, f, indent=2)  # Save updated list
+
+        print(f"✅ Successfully appended data to {filename}")
+
+    except Exception as e:
+        print(f"❌ Error while appending to JSON: {e}")
 
 print("Starting to process data from questions.csv...")
 
@@ -286,10 +305,12 @@ with open(DATA_FILE, "r", encoding="utf-8") as csvf:
             "responses": [response1, response2]
         })
 
+        append_to_json(structured_responses[-1])  # Append to JSON after each pair  
+
 print("Finished processing questions.csv.")
 
-with open(OUTPUT_JSON_FILE, "w", encoding="utf-8") as f:
-    json.dump(structured_responses, f, indent=2)
+# with open(OUTPUT_JSON_FILE, "w", encoding="utf-8") as f:
+#     json.dump(structured_responses, f, indent=2)
 
 print(f"Saved structured responses to {OUTPUT_JSON_FILE}.")
 
