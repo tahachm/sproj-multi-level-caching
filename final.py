@@ -1,7 +1,7 @@
 import os
 import csv
 import json
-import openai
+from openai import OpenAI
 import time
 from pymilvus import MilvusClient, model
 from groq import Groq
@@ -52,9 +52,11 @@ print("Embedding function initialized.")
 # print("CSV file ready for writing.")
 
 print("Setting up OpenAI client for Llama 1B...")
-openai.api_key = "027d952d-f652-409d-9a03-07d0eb613db0"
-openai.api_base = "https://api.sambanova.ai/v1"
-if not openai.api_key:
+openai_client = OpenAI(
+    api_key="027d952d-f652-409d-9a03-07d0eb613db0",  # This is the default and can be omitted
+)
+# openai.api_base = "https://api.sambanova.ai/v1"
+if openai_client.api_key is None:
     print("No API key set for Llama 1B. Llama 1B queries may fail.")
 else:
     print("Llama 1B client ready.")
@@ -98,8 +100,8 @@ def search_milvus(question_text, exclude_id=None):
                 continue
             
             # Found a valid match
-            print(f"Found match: ID={hit['id']}, Text={hit['entity']['text']}, Distance={hit['distance']}")
-            return hit["id"], hit["entity"]["text"], hit["distance"], hit["entity"]["response_text"]
+            print(f"Found match: ID={hit['id']}, Text={hit['entity']['question_text']}, Distance={hit['distance']}")
+            return hit["id"], hit["entity"]["question_text"], hit["distance"], hit["entity"]["response_text"]
     
     # If no valid match is found
     print("No suitable match found in Milvus.")
@@ -127,8 +129,8 @@ def query_llama_1b(new_question, cache_question, cache_resp):
     prompt = (
         f"You are an assistant tasked with refining and adjusting a response to align with a slightly modified question.\n"
         f"Below is a cached response that is similar but perhaps not perfectly suited to the new question.\n"
-        f"Your goal is to make minimal yet effective modifications to ensure the response fully answers the new question while preserving fluency, correctness, and completeness.\n\n"
-        f"Also, try to maintain the original response's relative lenght, where possible, but its okay if the question is completely different to change it."
+        f"Your goal is to make minimal yet effective modifications to ensure the response is relevant to the NEW question, and answers it accurately while preserving fluency, correctness, and completeness.\n\n"
+        f"Also, try to maintain the original response's length. Do not exceed 3 sentneces."
         
         f"New Question: {new_question}\n"
         f"Cached Question: {cache_question}\n"
@@ -151,17 +153,31 @@ def query_llama_1b(new_question, cache_question, cache_resp):
         f"Response for user: <tweaked response>\n"
     )
 
-    print("Querying Llama 1B with prompt:")
-    print(prompt)
+    print("Querying Llama 1B:")
 
-    response = openai.ChatCompletion.create(
-        model="Meta-Llama-3.2-1B-Instruct",
-        messages=[
-            {"role": "system", "content": "You are a helpful assistant who follows instructions carefully."},
-            {"role": "user", "content": prompt}
-        ],
-        temperature=0.1,
-        top_p=0.1
+    # response = openai.ChatCompletion.create(
+    #     model="Meta-Llama-3.2-1B-Instruct",
+    #     messages=[
+    #         {"role": "system", "content": "You are a helpful assistant who follows instructions carefully."},
+    #         {"role": "user", "content": prompt}
+    #     ],
+    #     temperature=0.1,
+    #     top_p=0.1
+    # )
+
+    # response = openai_client.chat.completions.create(
+    #     model="Meta-Llama-3.2-1B-Instruct",
+    #     messages=[
+    #         {"role": "system", "content": "You are a helpful assistant who follows instructions carefully."},
+    #         {"role": "user", "content": prompt}
+    #     ],
+    #     temperature=0.1,
+    #     top_p=0.1,
+    # )
+
+    response = groq_client.chat.completions.create(
+        messages=[{"role": "user", "content": prompt}],
+        model="llama-3.1-8b-instant",
     )
 
     r = response.choices[0].message.content.strip()
@@ -173,8 +189,8 @@ def query_llama_70b(question):
     print("Querying Llama 70B with question:")
     print(question)
     chat_completion = groq_client.chat.completions.create(
-        messages=[{"role": "user", "content": "Please limit your response for the following to a maximum of 3 paragraphs: " + question}],
-        model="llama-3.1-70b-versatile",
+        messages=[{"role": "user", "content": "Please limit your response for the following to a maximum of 3 sentences: " + question}],
+        model="llama-3.3-70b-versatile",
     )
     r = chat_completion.choices[0].message.content.strip()
     print("Llama 70B response:")
@@ -231,9 +247,10 @@ def process_question(qid, new_question):
     return {
         "qid": current_qid,
         "question": new_question,
+        "matched_qid": matched_qid,
+        "match_cosine_similarity": distance,
         "response": final_response,
         "generated_by": response_source,
-        "milvus_distance": distance
     }
 
 
@@ -264,7 +281,7 @@ with open(DATA_FILE, "r", encoding="utf-8") as csvf:
             "question1": question1,
             "qid2": qid2,
             "question2": question2,
-            "similarity_score": response1["milvus_distance"],  # Use distance from Milvus
+            # "similarity_score": response2["match_cosine_similarity"],  # Use distance from Milvus
             "responses": [response1, response2]
         })
 
