@@ -11,27 +11,24 @@ DATA_FILE = "questions.csv"
 MILVUS_DB_PATH = "queries.db"
 COLLECTION_NAME = "allQuestions"
 DIMENSION = 768
-CSV_FILE = "milvusRes.csv"
-JSON_FILE = "responses.json"
+# CSV_FILE = "milvusRes.csv"
+# JSON_FILE = "responses.json"
+OUTPUT_JSON_FILE = "structured_results.json"
+
+COSINE_SIMILARITY_THRESHOLD = 0.7
 
 print("=== Starting the script ===")
 print(f"Data file: {DATA_FILE}")
 print(f"Database file: {MILVUS_DB_PATH}")
 print(f"Collection: {COLLECTION_NAME}")
-print(f"CSV output: {CSV_FILE}")
-print(f"JSON output: {JSON_FILE}")
+# print(f"CSV output: {CSV_FILE}")
+# print(f"JSON output: {JSON_FILE}")
 
-# Ensure response JSON exists or create empty
-if not os.path.exists(JSON_FILE):
-    print(f"{JSON_FILE} does not exist. Creating an empty JSON.")
-    with open(JSON_FILE, "w") as f:
-        json.dump({}, f)
-
-# Load existing responses
-print("Loading existing responses from JSON...")
-with open(JSON_FILE, "r") as f:
-    responses_cache = json.load(f)
-print(f"Loaded {len(responses_cache)} existing responses.")
+# # Ensure response JSON exists or create empty
+# if not os.path.exists(JSON_FILE):
+#     print(f"{JSON_FILE} does not exist. Creating an empty JSON.")
+#     with open(JSON_FILE, "w") as f:
+#         json.dump({}, f)
 
 print("Initializing Milvus Client...")
 client = MilvusClient(MILVUS_DB_PATH)
@@ -46,13 +43,13 @@ print("Initializing embedding function...")
 embedding_fn = model.DefaultEmbeddingFunction()
 print("Embedding function initialized.")
 
-# Open CSV for appending milvus results
-csv_exists = os.path.exists(CSV_FILE)
-csvfile = open(CSV_FILE, "a", newline="", encoding="utf-8")
-csv_writer = csv.writer(csvfile)
-if not csv_exists:
-    csv_writer.writerow(["query_id", "cache_id", "query_question", "cache_question", "distance"])
-print("CSV file ready for writing.")
+# # Open CSV for appending milvus results
+# csv_exists = os.path.exists(CSV_FILE)
+# csvfile = open(CSV_FILE, "a", newline="", encoding="utf-8")
+# csv_writer = csv.writer(csvfile)
+# if not csv_exists:
+#     csv_writer.writerow(["query_id", "cache_id", "query_question", "cache_question", "distance"])
+# print("CSV file ready for writing.")
 
 print("Setting up OpenAI client for Llama 1B...")
 openai.api_key = "027d952d-f652-409d-9a03-07d0eb613db0"
@@ -69,14 +66,13 @@ if not groq_api_key:
 groq_client = Groq(api_key=groq_api_key)
 print("Llama 70B client ready.")
 
-def insert_question_into_milvus(question_text, qid):
+def insert_question_into_milvus(question_text, qid, response_text):
     qid = int(qid)
     print(f"Inserting question_id {qid} into Milvus: {question_text}")
     vec = embedding_fn.encode_queries([question_text])[0]
-    data = [{"id": qid, "vector": vec, "text": question_text}]
+    data = [{"id": qid, "vector": vec, "question_text": question_text, "response_text": response_text}]
     res = client.insert(collection_name=COLLECTION_NAME, data=data)
     print(f"Insert result: {res}")
-
 
 def search_milvus(question_text, exclude_id=None):
     """
@@ -91,7 +87,7 @@ def search_milvus(question_text, exclude_id=None):
         collection_name=COLLECTION_NAME,
         data=query_vec,
         limit=5,  # Request more results to ensure valid matches
-        output_fields=["text"]
+        output_fields=["question_text", "response_text"]
     )
     
     if res and len(res[0]) > 0:
@@ -103,47 +99,56 @@ def search_milvus(question_text, exclude_id=None):
             
             # Found a valid match
             print(f"Found match: ID={hit['id']}, Text={hit['entity']['text']}, Distance={hit['distance']}")
-            return hit["id"], hit["entity"]["text"], hit["distance"]
+            return hit["id"], hit["entity"]["text"], hit["distance"], hit["entity"]["response_text"]
     
     # If no valid match is found
     print("No suitable match found in Milvus.")
-    return None, None, None
-
+    return None, None, 0, None
 
 def get_cache_response_for_matched_qid(matched_qid):
+    """
+    Fetches the cached response from Milvus instead of JSON.
+    """
     if matched_qid is None:
-        return ""
-    matched_qid_str = str(matched_qid)
-    if matched_qid_str not in responses_cache:
-        return ""
-    entry = responses_cache[matched_qid_str]
-    extracted = entry.get("extracted_response", -1)
-    if extracted != -1 and extracted != "-1":
-        return extracted
-    if "70b_response" in entry and entry["70b_response"] != -1:
-        return entry["70b_response"]
-    return entry.get("1b_response", "")
+        return None
+
+    # Query Milvus to retrieve the stored response text
+    query_res = client.query(
+        collection_name=COLLECTION_NAME,
+        expr=f"id == {matched_qid}",
+        output_fields=["response_text"]
+    )
+    if not query_res or len(query_res) == 0:
+        raise ValueError(f"No cached response found for matched_qid={matched_qid}.")
+
+    return query_res[0]["response_text"]  # Return the stored response from Milvus
 
 def query_llama_1b(new_question, cache_question, cache_resp):
     prompt = (
-        f"You are an assistant deciding if we can reuse a cached response for a new user query.\n"
-        f"User's new question: {new_question}\n"
-        f"Cached question: {cache_question}\n"
-        f"Cached response: {cache_resp}\n\n"
-        "Step 1: Rate similarity between the new_question and cache_question on a scale of 0 to 1.\n"
-        "If they are identical or nearly identical in meaning, similarity should be 1.\n"
-        "If somewhat related but not identical, choose a value between 0 and 1 that reflects how closely they match.\n\n"
-        "Step 2: DECISION:\n"
-        "- If you can reuse the cached response as is or with slight tweaks to answer the new query well, DECISION: possible.\n"
-        "- If you think that the cached response can not be reused, even with slight tweak, DECISION: not possible.\n\n"
-        "If DECISION: possible and similarity > 0.7, provide the reused or tweaked response in 'Response for user:' line.\n"
-        "If DECISION: not possible, set 'Response for user:' to -1.\n\n"
-        "Finally, provide a Reason line explaining your thinking.\n\n"
-        "Format:\n"
-        "SIMILARITY: <value>\n"
-        "Reason: <justification>\n"
-        "Response for user: <tweaked response or -1>\n"
-        "DECISION: possible or not possible\n"
+        f"You are an assistant tasked with refining and adjusting a response to align with a slightly modified question.\n"
+        f"Below is a cached response that is similar but perhaps not perfectly suited to the new question.\n"
+        f"Your goal is to make minimal yet effective modifications to ensure the response fully answers the new question while preserving fluency, correctness, and completeness.\n\n"
+        f"Also, try to maintain the original response's relative lenght, where possible, but its okay if the question is completely different to change it."
+        
+        f"New Question: {new_question}\n"
+        f"Cached Question: {cache_question}\n"
+        f"Cached Response: {cache_resp}\n"
+        
+        f"Instructions:\n"
+        f"1. Identify the key differences between the New Question and the Cached Question.\n"
+        f"2. Modify the Cached Response only as needed to fully address the New Question.\n"
+        f"3. Ensure clarity and coherence, keeping the response concise and informative.\n"
+        f"4. Do not introduce unnecessary changes—only tweak for relevance.\n\n"
+        
+        f"Example:\n"
+        f"- New Question: \"What is the step-by-step guide to invest in the share market in India?\"\n"
+        f"- Cached Question: \"What is the step-by-step guide to invest in the share market?\"\n"
+        f"- Cached Response: \"[Step-by-step guide for general share market investing]\"\n"
+        f"- Modified Response: \"[Step-by-step guide with India-specific regulations, brokers, and taxation details]\"\n\n"
+        
+        f"Now, generate the revised response:\n"
+        f"Reponse format:\n"
+        f"Response for user: <tweaked response>\n"
     )
 
     print("Querying Llama 1B with prompt:")
@@ -179,145 +184,96 @@ def query_llama_70b(question):
 def parse_1b_response(response_text):
     # Extract fields
     lines = response_text.split("\n")
-    similarity = 0.0
-    decision = "not possible"
     response_for_user = ""
-    reason = ""
-
+    
     for line in lines:
         lower_line = line.strip().lower()
-        if lower_line.startswith("similarity:"):
-            try:
-                similarity_str = line.split(":", 1)[1].strip()
-                similarity = float(similarity_str)
-            except:
-                similarity = 0.0
-        elif lower_line.startswith("decision:"):
-            dec_str = line.split(":", 1)[1].strip().lower()
-            if "possible" in dec_str:
-                decision = "possible"
-            else:
-                decision = "not possible"
-        elif lower_line.startswith("response for user:"):
+        if lower_line.startswith("response for user:"):
             response_for_user = line.split(":", 1)[1].strip()
-        elif lower_line.startswith("reason:"):
-            reason = line.split(":", 1)[1].strip()
+       
+    return response_for_user
 
-    return similarity, decision, response_for_user, reason
+def process_question(qid, new_question):
+    """
+    Handles processing of a single question.
+    - Searches Milvus for a cached response.
+    - Uses a small model to refine (cache hit) or a large model to generate (cache miss).
+    - Stores and retrieves responses from Milvus instead of a JSON file.
+    - Returns a structured dictionary for logging results.
+    """
+    current_qid = int(qid)
+    print(f"Processing question_id {current_qid}: {new_question}")
+
+    matched_qid, matched_q_text, distance, matched_q_response = search_milvus(new_question, exclude_id=current_qid)
+    cache_hit = distance >= COSINE_SIMILARITY_THRESHOLD
+
+    llama_1b_response = ""
+    llama_70b_response = ""
+    response_source = ""
+
+    if cache_hit:
+        # Query smaller model to tweak the response
+        llama_1b_response = parse_1b_response(query_llama_1b(new_question, matched_q_text, matched_q_response))
+        response_source = "cache_hit (Llama 1B)"
+    else:
+        # Query large model to generate response from scratch
+        llama_70b_response = query_llama_70b(new_question)
+        response_source = "cache_miss (Llama 70B)"
+
+    final_response = llama_1b_response if llama_1b_response else llama_70b_response
+
+    # Store the response **directly in Milvus**
+    insert_question_into_milvus(new_question, current_qid, final_response)
+
+    print(f"Finished processing question_id {current_qid}")
+
+    # Return structured data for JSON output
+    return {
+        "qid": current_qid,
+        "question": new_question,
+        "response": final_response,
+        "generated_by": response_source,
+        "milvus_distance": distance
+    }
+
 
 print("Starting to process data from questions.csv...")
 
 killSwitch = 0
-
+structured_responses = []
 with open(DATA_FILE, "r", encoding="utf-8") as csvf:
     reader = csv.DictReader(csvf)
+    
     for row in reader:
         time.sleep(3)
         killSwitch += 1
         if killSwitch > 2000:
             break
 
-        # ---- Process question 1 ----
         qid1 = row["qid1"]
-        current_qid = int(qid1)
-        new_question = row["question1"].strip('"')
-        print(f"Processing question_id {current_qid}: {new_question}")
-
-        matched_qid, matched_q_text, distance = search_milvus(new_question, exclude_id=current_qid)
-        if matched_qid is not None and matched_q_text is not None:
-            csv_writer.writerow([current_qid, matched_qid, new_question, matched_q_text, distance])
-            csvfile.flush()  # Flush after every write
-            cache_resp = get_cache_response_for_matched_qid(matched_qid)
-            llama_1b_raw = query_llama_1b(new_question, matched_q_text, cache_resp)
-        else:
-            matched_qid = -1
-            matched_q_text = ""
-            distance = -1
-            csv_writer.writerow([current_qid, matched_qid, new_question, matched_q_text, distance])
-            csvfile.flush()  # Flush after every write
-            llama_1b_raw = query_llama_1b(new_question, "", "")
-
-        similarity, decision, response_for_user, reason = parse_1b_response(llama_1b_raw)
-        if decision == "possible" and response_for_user != "-1" and response_for_user.strip():
-            extracted_response = response_for_user
-            responses_cache[str(current_qid)] = {
-                "1b_response": llama_1b_raw,
-                "70b_response": -1,
-                "extracted_response": extracted_response,
-                "1b_distance": similarity
-            }
-        else:
-            extracted_response = -1
-            llama_70b_answer = query_llama_70b(new_question)
-            responses_cache[str(current_qid)] = {
-                "1b_response": llama_1b_raw,
-                "70b_response": llama_70b_answer,
-                "extracted_response": extracted_response,
-                "1b_distance": similarity
-            }
-
-        # Write JSON after each processed question
-        with open(JSON_FILE, "w") as f:
-            json.dump(responses_cache, f, indent=2)
-
-        insert_question_into_milvus(new_question, current_qid)
-        print(f"Finished processing question_id {current_qid}")
-
-
-        # ---- Process question 2 ----
         qid2 = row["qid2"]
-        current_qid = int(qid2)
-        new_question = row["question2"].strip('"')
-        print(f"Processing question_id {current_qid}: {new_question}")
+        question1 = row["question1"].strip('"')
+        question2 = row["question2"].strip('"')
 
-        matched_qid, matched_q_text, distance = search_milvus(new_question, exclude_id=current_qid)
-        if matched_qid is not None and matched_q_text is not None:
-            csv_writer.writerow([current_qid, matched_qid, new_question, matched_q_text, distance])
-            csvfile.flush()  # Flush after every write
-            cache_resp = get_cache_response_for_matched_qid(matched_qid)
-            llama_1b_raw = query_llama_1b(new_question, matched_q_text, cache_resp)
-        else:
-            matched_qid = -1
-            matched_q_text = ""
-            distance = -1
-            csv_writer.writerow([current_qid, matched_qid, new_question, matched_q_text, distance])
-            csvfile.flush()  # Flush after every write
-            llama_1b_raw = query_llama_1b(new_question, "", "")
+        response1 = process_question(qid1, question1)
+        response2 = process_question(qid2, question2)
 
-        similarity, decision, response_for_user, reason = parse_1b_response(llama_1b_raw)
+        # Store results in the structured_responses list
+        structured_responses.append({
+            "qid1": qid1,
+            "question1": question1,
+            "qid2": qid2,
+            "question2": question2,
+            "similarity_score": response1["milvus_distance"],  # Use distance from Milvus
+            "responses": [response1, response2]
+        })
 
-        if decision == "possible" and response_for_user != "-1":
-            extracted_response = response_for_user
-        else:
-            extracted_response = -1
+print("Finished processing questions.csv.")
 
-        if response_for_user == "-1":
-            llama_70b_answer = query_llama_70b(new_question)
-            responses_cache[str(current_qid)] = {
-                "1b_response": llama_1b_raw,
-                "70b_response": llama_70b_answer,
-                "extracted_response": extracted_response,
-                "1b_distance": similarity
-            }
-        else:
-            responses_cache[str(current_qid)] = {
-                "1b_response": llama_1b_raw,
-                "70b_response": -1,
-                "extracted_response": extracted_response,
-                "1b_distance": similarity
-            }
+with open(OUTPUT_JSON_FILE, "w", encoding="utf-8") as f:
+    json.dump(structured_responses, f, indent=2)
 
-        # Write JSON after each processed question
-        with open(JSON_FILE, "w") as f:
-            json.dump(responses_cache, f, indent=2)
+print(f"Saved structured responses to {OUTPUT_JSON_FILE}.")
 
-        insert_question_into_milvus(new_question, current_qid)
-        print(f"Finished processing question_id {current_qid}")
-
-print("Finished reading questions.csv.")
-
-# Close CSV file
-csvfile.close()
-print("CSV file closed.")
 
 print("=== Processing complete ===")
