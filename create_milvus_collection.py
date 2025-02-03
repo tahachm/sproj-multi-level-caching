@@ -34,9 +34,9 @@ index_params = client.prepare_index_params()
 # - For a vector field
 index_params.add_index(
     field_name="vector",
-    index_type="IVF_FLAT",
+    index_type="FLAT",
     metric_type="COSINE",
-    params={"nlist": 1024}
+    # params={"nlist": 1024}
 )
 
 # 6. Create indexes

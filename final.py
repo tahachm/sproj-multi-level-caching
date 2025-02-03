@@ -256,15 +256,16 @@ def process_question(qid, new_question):
 
 print("Starting to process data from questions.csv...")
 
-killSwitch = 0
+kill_switch = 0
+KILL_LIMIT = 5
 structured_responses = []
 with open(DATA_FILE, "r", encoding="utf-8") as csvf:
     reader = csv.DictReader(csvf)
     
     for row in reader:
         time.sleep(3)
-        killSwitch += 1
-        if killSwitch > 2000:
+        kill_switch += 1
+        if kill_switch > KILL_LIMIT:
             break
 
         qid1 = row["qid1"]
